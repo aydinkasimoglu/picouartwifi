@@ -153,6 +153,10 @@ static void send_udp_packet(uint8_t *data, const uint16_t len)
     /* lock lwIP core */
     cyw43_arch_lwip_begin();
     (void) udp_sendto(udp_socket, p, &server_ip, UDP_PORT);
+    /* Blink LED briefly to indicate outbound packet (use CYW43 GPIO on Pico W) */
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+    sleep_ms(30);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
     cyw43_arch_lwip_end();
 
     /* udp_sendto doesn't free the pbuf, so we must free it. */
@@ -225,11 +229,15 @@ static int setup_wifi(void)
         return 1;
     }
 
+    /* Indicate we're starting connection attempt (turn LED off) */
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+
     /* Enable Station mode */
     cyw43_arch_enable_sta_mode();
 
     if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, WIFI_CONNECT_TIMEOUT_MS))
     {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
         DBG("Couldn't connect to Wi-Fi.");
         return 1;
     }
@@ -246,6 +254,7 @@ static int setup_wifi(void)
     udp_socket = udp_new();
     if (!udp_socket)
     {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
         cyw43_arch_lwip_end();
         DBG("Couldn't create new UDP socket.");
         return 1;
@@ -254,12 +263,16 @@ static int setup_wifi(void)
     /* Prepare destination IP */
     if (!ipaddr_aton(UDP_SERVER_IP, &server_ip))
     {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
         cyw43_arch_lwip_end();
         DBG("Couldn't convert the IP to binary address.");
         return 1;
     }
 
     cyw43_arch_lwip_end();
+
+    /* Successful connection: turn LED on */
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
     return 0;
 }
