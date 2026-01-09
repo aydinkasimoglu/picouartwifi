@@ -26,12 +26,17 @@
 #define WIFI_PASSWORD "---------------" /* Wi-Fi password to connect to. */
 #define WIFI_CONNECT_TIMEOUT_MS 10000U  /* Maximum time to wait for Wi-Fi connection attempt (milliseconds). */
 
-#define UDP_SERVER_IP "---------------" /* Destination UDP server. */
-#define UDP_PORT      4444U             /* Destination UDP port. */
+/* Periodically check link status and attempt reconnect with backoff when disconnected. */
+#define WIFI_LINK_CHECK_INTERVAL_MS     2000U  /* Normal link-status poll period (milliseconds). */
+#define WIFI_RECONNECT_INITIAL_DELAY_MS 1000U  /* Initial delay between reconnect attempts (milliseconds). */
+#define WIFI_RECONNECT_MAX_DELAY_MS     10000U /* Max delay between reconnect attempts (milliseconds). */
+
+#define UDP_SERVER_IP "10.198.241.224" /* Destination UDP server. */
+#define UDP_PORT      4444U           /* Destination UDP port. */
 
 #define UART_ID     uart0            /* UART peripheral to use. */
 #define UART_IRQ    UART0_IRQ        /* IRQ line for the selected UART. */
-#define BAUD_RATE   115200U          /* UART baud rate. */
+#define BAUD_RATE   9600U          /* UART baud rate. */
 #define DATA_BITS   8U               /* UART data bits. */
 #define STOP_BITS   1U               /* UART stop bits. */
 #define PARITY      UART_PARITY_NONE /* UART parity selection. */
@@ -69,6 +74,7 @@ typedef enum UART_State
 typedef struct Sensor_Payload
 {
     uint32_t pressure_pa;
+    int32_t  temperature_c;
     uint16_t distance_mm;
 } Sensor_Payload_t;
 #pragma pack(pop)
@@ -98,6 +104,13 @@ static struct udp_pcb *udp_socket;
 static ip_addr_t server_ip;
 static uint32_t seq_counter = 0;
 
+static bool cyw43_initialized = false;
+static bool server_ip_valid = false;
+
+static volatile bool wifi_connected = false;
+static absolute_time_t next_wifi_check;
+static uint32_t wifi_reconnect_delay_ms = WIFI_RECONNECT_INITIAL_DELAY_MS;
+
 static volatile bool    sensor_payload_ready = false; /* Latest valid sensor payload. */
 static volatile uint8_t sensor_payload_buf[sizeof(Sensor_Payload_t)];
 /* ------------------------------------------ */
@@ -109,20 +122,23 @@ static void uart_rx_isr(void);
 static void send_udp_packet(uint8_t id, const uint8_t *raw_data);
 static uint16_t calc_crc16_frame(uint8_t len, uint8_t id, const uint8_t *payload);
 static uint16_t crc16_ccitt_update(uint16_t crc, uint8_t byte);
+static inline bool wifi_is_connected(void);
+static void wifi_poll_and_reconnect_if_needed(void);
+static bool ensure_udp_socket(void);
 /* ------------------------------------------ */
 
 int main(void)
 {
     stdio_init_all();
 
-    if (setup_wifi()) {
-        return 1;
-    }
+    setup_wifi();
 
     setup_uart();
 
     while (1)
     {
+        wifi_poll_and_reconnect_if_needed();
+
         if (sensor_payload_ready)
         {
             uint8_t local_payload[sizeof(Sensor_Payload_t)];
@@ -145,6 +161,9 @@ int main(void)
                 send_udp_packet(MSG_ID_SENSOR, local_payload);
             }
         }
+
+        /* Prevent a tight busy-loop; gives time for background work/IRQs. */
+        sleep_ms(1);
     }
 
     return 0;
@@ -152,16 +171,28 @@ int main(void)
 
 /**
  * @brief Initializes and configures the Wi-Fi connection
- * 
+ *
  * Sets up the Wi-Fi interface with necessary configuration parameters
  * and establishes a connection to the configured network.
- * 
+ *
  * @retval int Returns 0 on successful Wi-Fi setup, 1 on failure
  */
 static int setup_wifi(void)
 {
     if (cyw43_arch_init())
     {
+        cyw43_initialized = false;
+        return 1;
+    }
+
+    cyw43_initialized = true;
+
+    /* Parse destination IP early so reconnects can recreate the UDP PCB. */
+    server_ip_valid = ipaddr_aton(UDP_SERVER_IP, &server_ip);
+    if (!server_ip_valid)
+    {
+        cyw43_arch_deinit();
+        cyw43_initialized = false;
         return 1;
     }
 
@@ -183,39 +214,125 @@ static int setup_wifi(void)
         sleep_ms(100);
     }
 
-    cyw43_arch_lwip_begin();
-
-    /* Create UDP PCB (Protocol Control Buffer) */
-    udp_socket = udp_new();
-    if (!udp_socket)
+    if (!ensure_udp_socket())
     {
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        cyw43_arch_lwip_end();
         return 1;
     }
-
-    /* Prepare destination IP */
-    if (!ipaddr_aton(UDP_SERVER_IP, &server_ip))
-    {
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-        cyw43_arch_lwip_end();
-        return 1;
-    }
-
-    cyw43_arch_lwip_end();
 
     /* Successful connection: turn LED on */
+    wifi_connected = true;
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+
+    next_wifi_check = make_timeout_time_ms(WIFI_LINK_CHECK_INTERVAL_MS);
+    wifi_reconnect_delay_ms = WIFI_RECONNECT_INITIAL_DELAY_MS;
 
     return 0;
 }
 
+static inline bool wifi_is_connected(void)
+{
+    if (!cyw43_initialized)
+    {
+        return false;
+    }
+    return cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP;
+}
+
+static void wifi_poll_and_reconnect_if_needed(void)
+{
+    if (!cyw43_initialized)
+    {
+        return;
+    }
+
+    if (!time_reached(next_wifi_check))
+    {
+        return;
+    }
+
+    const bool connected_now = wifi_is_connected();
+    wifi_connected = connected_now;
+
+    if (connected_now)
+    {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+        wifi_reconnect_delay_ms = WIFI_RECONNECT_INITIAL_DELAY_MS;
+        next_wifi_check = make_timeout_time_ms(WIFI_LINK_CHECK_INTERVAL_MS);
+        return;
+    }
+
+    /* Disconnected: indicate and attempt reconnect. */
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+
+    /* Drop any existing PCB so a reconnect gets a clean socket. */
+    if (udp_socket)
+    {
+        cyw43_arch_lwip_begin();
+        udp_remove(udp_socket);
+        udp_socket = NULL;
+        cyw43_arch_lwip_end();
+    }
+
+    (void)cyw43_arch_wifi_connect_timeout_ms(
+        WIFI_SSID,
+        WIFI_PASSWORD,
+        CYW43_AUTH_WPA2_AES_PSK,
+        WIFI_CONNECT_TIMEOUT_MS);
+
+    /* Re-check whether connection succeeded; if it did, reset backoff. */
+    const bool connected_after = wifi_is_connected();
+    wifi_connected = connected_after;
+
+    if (connected_after)
+    {
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
+
+        (void)ensure_udp_socket();
+
+        wifi_reconnect_delay_ms = WIFI_RECONNECT_INITIAL_DELAY_MS;
+        next_wifi_check = make_timeout_time_ms(WIFI_LINK_CHECK_INTERVAL_MS);
+    }
+    else
+    {
+        if (wifi_reconnect_delay_ms < WIFI_RECONNECT_MAX_DELAY_MS)
+        {
+            wifi_reconnect_delay_ms *= 2U;
+            if (wifi_reconnect_delay_ms > WIFI_RECONNECT_MAX_DELAY_MS)
+            {
+                wifi_reconnect_delay_ms = WIFI_RECONNECT_MAX_DELAY_MS;
+            }
+        }
+
+        next_wifi_check = make_timeout_time_ms(wifi_reconnect_delay_ms);
+    }
+}
+
+static bool ensure_udp_socket(void)
+{
+    if (!cyw43_initialized || !server_ip_valid)
+    {
+        return false;
+    }
+
+    if (udp_socket)
+    {
+        return true;
+    }
+
+    cyw43_arch_lwip_begin();
+    udp_socket = udp_new();
+    cyw43_arch_lwip_end();
+
+    return udp_socket != NULL;
+}
+
 /**
  * @brief Initializes and configures the UART peripheral
- * 
+ *
  * Sets up the UART interface with appropriate pins, baud rate, and other
  * configuration parameters required for serial communication.
- * 
+ *
  * @retval void
  */
 static void setup_uart(void)
@@ -239,7 +356,7 @@ static void setup_uart(void)
 
 /**
  * @brief UART receive interrupt service routine handler.
- * 
+ *
  * This function is called when data is received on the UART interface.
  * It handles the incoming data and processes it according to the application logic.
  *
@@ -369,7 +486,7 @@ static void send_udp_packet(const uint8_t id, const uint8_t *raw_data)
 
     memcpy(&packet.sensor_data, raw_data, sizeof(Sensor_Payload_t));
 
-    if (!udp_socket)
+    if (!udp_socket || !wifi_connected)
     {
         return;
     }
@@ -392,21 +509,26 @@ static void send_udp_packet(const uint8_t id, const uint8_t *raw_data)
     /* Blink LED briefly to indicate outbound packet (Pico W CYW43 LED). */
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
     sleep_ms(30);
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, wifi_connected ? 1 : 0);
 }
 
 /**
  * @brief Calculates the CRC16 checksum for a frame.
- * 
+ *
  * @param len The length of the payload in bytes.
  * @param id The frame identifier.
  * @param payload Pointer to the payload data buffer.
- * 
+ *
  * @retval uint16_t The calculated CRC16 checksum value.
  */
 static uint16_t calc_crc16_frame(const uint8_t len, const uint8_t id, const uint8_t *payload)
 {
-    uint16_t crc = 0;
+    uint16_t crc = 0xFFFF;
+
+    /* CRC covers the complete on-wire frame up to (excluding) the CRC field:
+       { HEADER_1, HEADER_2, LEN, ID, PAYLOAD[LEN] }. */
+    crc = crc16_ccitt_update(crc, HEADER_1);
+    crc = crc16_ccitt_update(crc, HEADER_2);
     crc = crc16_ccitt_update(crc, len);
     crc = crc16_ccitt_update(crc, id);
 
@@ -421,7 +543,7 @@ static uint16_t calc_crc16_frame(const uint8_t len, const uint8_t id, const uint
 /**
  * @brief Updates a CRC-16-CCITT checksum with a new byte.
  *
- * Performs an incremental CRC-16-CCITT calculation by processing one 
+ * Performs an incremental CRC-16-CCITT calculation by processing one
  * byte at a time. This function is typically called iteratively
  * over a data stream to compute the full checksum.
  *
